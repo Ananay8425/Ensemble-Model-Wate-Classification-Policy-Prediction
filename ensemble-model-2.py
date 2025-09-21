@@ -6,8 +6,8 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-# Scikit-learn Imports for Regression
-from sklearn.model_selection import train_test_split
+# Scikit-learn Imports
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
@@ -28,25 +28,15 @@ RANDOM_STATE = 42
 
 # --- 2. DATA LOADING ---
 print("Step 2: Loading and verifying the dataset...")
-data_file = Path(DATA_PATH)
-if not data_file.exists():
-    raise FileNotFoundError(f"Data file not found at: {DATA_PATH}")
-df = pd.read_csv(data_file)
+df = pd.read_csv(DATA_PATH)
 print(f"Loaded data with {df.shape[0]} rows.")
 
-
-# --- 3. FEATURE AND TARGET SELECTION (with more features) ---
+# --- 3. FEATURE AND TARGET SELECTION ---
 print("\nStep 3: Selecting available features and targets...")
-# We are adding more features to see if we can improve the model
 potential_feature_cols = [
-    'income_id',
-    'population_population_number_of_people', # Added Population
-    'total_msw_total_msw_generated_tons_year', # Added Total Waste
-    'waste_treatment_anaerobic_digestion_percent',
-    'waste_treatment_compost_percent',
-    'waste_treatment_incineration_percent',
-    'waste_treatment_landfill_percent',
-    'waste_treatment_recycling_percent'
+    'income_id', 'population_population_number_of_people', 'total_msw_total_msw_generated_tons_year',
+    'waste_treatment_anaerobic_digestion_percent', 'waste_treatment_compost_percent',
+    'waste_treatment_incineration_percent', 'waste_treatment_landfill_percent', 'waste_treatment_recycling_percent'
 ]
 potential_target_cols = [
     'composition_food_organic_waste_percent', 'composition_glass_percent', 'composition_metal_percent',
@@ -58,13 +48,9 @@ feature_cols = [col for col in potential_feature_cols if col in df.columns]
 target_cols = [col for col in potential_target_cols if col in df.columns]
 
 print(f"\nFound and using {len(feature_cols)} feature columns: {feature_cols}")
-print(f"Found and using {len(target_cols)} target columns to predict.")
-
 df_model = df[feature_cols + target_cols].copy()
 df_model.dropna(subset=target_cols, how='all', inplace=True)
 print(f"Data shape after cleaning: {df_model.shape}")
-
-# The rest of the script is the same...
 
 # --- 4. FEATURE AND TARGET PREPARATION ---
 print("\nStep 4: Preparing features (X) and targets (y)...")
@@ -87,33 +73,64 @@ categorical_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='mo
 
 preprocessor = ColumnTransformer(transformers=[('num', numeric_transformer, numeric_features), ('cat', categorical_transformer, categorical_features)])
 
-# --- 7. ENSEMBLE REGRESSION MODEL DEFINITION ---
+# --- 7. ENSEMBLE MODEL DEFINITION ---
 print("\nStep 7: Defining the ensemble regression model...")
 estimators = [
-    ('rf', RandomForestRegressor(n_estimators=100, random_state=RANDOM_STATE)),
-    ('gb', GradientBoostingRegressor(n_estimators=100, random_state=RANDOM_STATE))
+    ('rf', RandomForestRegressor(random_state=RANDOM_STATE)),
+    ('gb', GradientBoostingRegressor(random_state=RANDOM_STATE))
 ]
 if XGBOOST_AVAILABLE:
     estimators.append(('xgb', XGBRegressor(objective='reg:squarederror', random_state=RANDOM_STATE)))
 
 stacking_regressor = StackingRegressor(estimators=estimators, final_estimator=RidgeCV(), cv=5)
 
-# --- 8. MODEL TRAINING ---
-print("\nStep 8: Training the Stacking Ensemble Regressor...")
+# The final model pipeline
 model_pipeline = Pipeline(steps=[
     ('preprocessor', preprocessor),
     ('regressor', MultiOutputRegressor(stacking_regressor))
 ])
-model_pipeline.fit(X_train, y_train)
-print("Model training complete.")
+
+# --- 8. HYPERPARAMETER TUNING ---
+print("\nStep 8: Performing Hyperparameter Tuning...")
+
+# Define the settings we want to test.
+# The format 'regressor__estimator__<model_name>__<parameter>' targets each part of the pipeline.
+param_distributions = {
+    'regressor__estimator__rf__n_estimators': [50, 100, 200],
+    'regressor__estimator__rf__max_depth': [None, 10, 20],
+    'regressor__estimator__gb__n_estimators': [50, 100, 200],
+    'regressor__estimator__gb__learning_rate': [0.01, 0.1, 0.2]
+}
+
+# Set up the search. It will try 20 random combinations from the distributions above.
+random_search = RandomizedSearchCV(
+    model_pipeline,
+    param_distributions=param_distributions,
+    n_iter=20, # Number of parameter settings that are sampled.
+    cv=3,      # Use 3-fold cross-validation.
+    random_state=RANDOM_STATE,
+    n_jobs=-1  # Use all available CPU cores to speed up the process.
+)
+
+# Run the search on the training data. This is the main training step.
+random_search.fit(X_train, y_train)
+
+print("\nHyperparameter tuning complete.")
+print("Best parameters found:")
+print(random_search.best_params_)
 
 # --- 9. RESULTS AND EVALUATION ---
-print("\n--- MODEL EVALUATION RESULTS ---")
-y_pred = model_pipeline.predict(X_test)
+print("\n--- FINAL MODEL EVALUATION RESULTS ---")
+# Use the best model found by the search to make predictions.
+best_model = random_search.best_estimator_
+y_pred = best_model.predict(X_test)
+
 r2 = r2_score(y_test, y_pred)
 mae = mean_absolute_error(y_test, y_pred)
 mse = mean_squared_error(y_test, y_pred)
-accuracy = 1 - mse / np.var(y_test)
+accuracy = 1 - (mse / np.var(y_test))
+
+print(f"\nResults using the best model:")
 print(f"R-squared (R²): {r2:.4f}")
 print(f"Mean Absolute Error (MAE): {mae:.4f}")
 print(f"Mean Squared Error (MSE): {mse:.4f}")
