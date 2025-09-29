@@ -1,127 +1,97 @@
 import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-
+warnings.filterwarnings("ignore")
 import numpy as np
 import pandas as pd
-from pathlib import Path
+import os
+import re
+from skimage.io import imread
+from skimage.transform import resize
+from skimage.feature import hog # Import the new feature extractor
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
-from sklearn.impute import SimpleImputer
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, StackingClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from imblearn.pipeline import Pipeline
 from imblearn.over_sampling import SMOTE
-from imblearn.pipeline import Pipeline as ImbPipeline
-try:
-    from xgboost import XGBClassifier
-    XGBOOST_AVAILABLE = True
-except ImportError:
-    XGBOOST_AVAILABLE = False
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
+from sklearn.ensemble import RandomForestClassifier
 
 # --- 1. CONFIGURATION ---
-DATA_PATH = 'E:/PROGRAMMING-2/Ensemble-Model-Wate-Classification-Policy-Prediction/dataset/Waste_national_2018_v1.3.2_9b1bb41.csv'
-RANDOM_STATE = 42
-TARGET_COLUMN = 'Flowable'
-FEATURE_COLUMNS = ['SectorProducedBy', 'SectorConsumedBy', 'FlowAmount']
-# We will keep the top 5 most frequent classes and group the rest.
-N_TOP_CLASSES = 5
+IMAGE_FOLDER_PATH = "E:/PROGRAMMING-2/Ensemble-Model-Wate-Classification-Policy-Prediction/dataset/Dataset-OR"
+RANDOM_STATE = 50
+IMG_SIZE = (64, 64) # HOG works well with this size
+CLASS_NAMES = ['organic', 'recyclable']
 
-# --- 2. DATA LOADING ---
-print("Step 2: Loading dataset...")
-data_file = Path(DATA_PATH)
-if not data_file.exists():
-    raise FileNotFoundError(f"Data file not found at: {DATA_PATH}")
+# --- 2. LOAD DATA AND EXTRACT HOG FEATURES ---
+print(f"Step 2: Loading images and extracting HOG features...")
+all_features, all_labels = [], []
 
-df = pd.read_csv(data_file)
-df_model = df[FEATURE_COLUMNS + [TARGET_COLUMN]].copy()
-df_model.dropna(subset=[TARGET_COLUMN], inplace=True)
-print(f"Loaded and cleaned data: {df_model.shape[0]} rows.")
+PREFIX_TO_LABEL_MAP = {
+    'o': 0, 'r': 1
+}
 
-# --- 3. ROBUST CLASS GROUPING ---
-print("\nStep 3: Grouping rare classes by keeping the top N...")
-# Get the counts of each material type
-class_counts = df_model[TARGET_COLUMN].value_counts()
-# Identify the top N most frequent classes
-top_classes = class_counts.nlargest(N_TOP_CLASSES).index
-print(f"Keeping the top {N_TOP_CLASSES} classes: {top_classes.tolist()}")
+for filename in os.listdir(IMAGE_FOLDER_PATH):
+    if not filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+        continue
+    
+    match = re.match(r"([a-zA-Z]+)", filename)
+    if not match:
+        continue
+    
+    prefix = match.group(1).lower()
+    if prefix in PREFIX_TO_LABEL_MAP:
+        label = PREFIX_TO_LABEL_MAP[prefix]
+        file_path = os.path.join(IMAGE_FOLDER_PATH, filename)
+        try:
+            img = imread(file_path, as_gray=True)
+            img_resized = resize(img, IMG_SIZE, anti_aliasing=True)
+            
+            # THE KEY CHANGE IS HERE: Extract HOG features instead of flattening
+            hog_features = hog(img_resized, pixels_per_cell=(8, 8),
+                               cells_per_block=(2, 2), visualize=False)
+            
+            all_features.append(hog_features)
+            all_labels.append(label)
+        except Exception as e:
+            print(f"  - Warning: Could not load image {filename}. Error: {e}")
 
-# Group all other classes into a single 'Other' category.
-# np.where(condition, value_if_true, value_if_false)
-df_model[TARGET_COLUMN] = np.where(df_model[TARGET_COLUMN].isin(top_classes), df_model[TARGET_COLUMN], 'Other')
-print(f"Number of classes after grouping: {df_model[TARGET_COLUMN].nunique()}")
-print("New class distribution:")
-print(df_model[TARGET_COLUMN].value_counts())
+X, y = np.array(all_features), np.array(all_labels)
+print(f"\nData loaded successfully. Total samples: {len(X)}")
+print(f"Number of features per image: {X.shape[1]}") # Note the new feature size
 
-# --- 4. TARGET VARIABLE PREPARATION ---
-print("\nStep 4: Encoding target variable (y)...")
-label_encoder = LabelEncoder()
-y = label_encoder.fit_transform(df_model[TARGET_COLUMN])
+# --- 3. DATA SPLITTING ---
+print("\nStep 3: Splitting data...")
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, stratify=y, random_state=RANDOM_STATE)
 
-# --- 5. FEATURE PREPARATION AND DATA SPLITTING ---
-print("\nStep 5: Preparing features (X) and splitting data...")
-X = df_model[FEATURE_COLUMNS]
-# This split will now work without errors.
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.25, stratify=y, random_state=RANDOM_STATE)
-print(f"Training set size: {len(X_train)}, Test set size: {len(X_test)}")
+# --- 4. BUILD & TRAIN THE FINAL OPTIMIZED MODEL ---
+print("\nStep 4: Defining and training the final model with SMOTE...")
+print("This may take several minutes...")
 
-
-# --- 6. PREPROCESSING PIPELINE DEFINITION ---
-print("\nStep 6: Building feature preprocessing pipeline...")
-categorical_features = ['SectorProducedBy', 'SectorConsumedBy']
-numeric_features = ['FlowAmount']
-
-numeric_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())])
-categorical_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='most_frequent')), ('onehot', OneHotEncoder(handle_unknown='ignore'))])
-
-preprocessor = ColumnTransformer(
-    transformers=[
-        ('num', numeric_transformer, numeric_features),
-        ('cat', categorical_transformer, categorical_features)
-    ])
-
-# --- 7. ENSEMBLE MODEL DEFINITION ---
-print("\nStep 7: Defining the ensemble model...")
-estimators = [
-    ('rf', RandomForestClassifier(n_estimators=50, random_state=RANDOM_STATE)), # Reduced n_estimators for small data
-    ('gb', GradientBoostingClassifier(n_estimators=50, random_state=RANDOM_STATE)) # Reduced n_estimators
-]
-if XGBOOST_AVAILABLE:
-    estimators.append(('xgb', XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', n_estimators=50, random_state=RANDOM_STATE)))
-
-stacking_classifier = StackingClassifier(estimators=estimators, final_estimator=LogisticRegression(), cv=3) # Reduced CV folds to 3
-
-# --- 8. MODEL TRAINING ---
-print("\nStep 8: Training the Stacking Ensemble Model...")
-# Adjusting k_neighbors for SMOTE. It must be less than the smallest class size in the training set.
-# We calculate the smallest class size and set k_neighbors accordingly.
-min_class_size = pd.Series(y_train).value_counts().min()
-smote_k_neighbors = max(1, min_class_size - 1)
-print(f"Smallest class in training set has {min_class_size} samples. Setting SMOTE k_neighbors to {smote_k_neighbors}.")
-
-model_pipeline = ImbPipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('smote', SMOTE(random_state=RANDOM_STATE, k_neighbors=smote_k_neighbors)),
-    ('classifier', stacking_classifier)
+model_pipeline = Pipeline(steps=[
+    ('smote', SMOTE(random_state=RANDOM_STATE)), # <-- ADD SMOTE HERE
+    ('scaler', StandardScaler()),
+    ('classifier', RandomForestClassifier(
+        n_estimators=200,
+        random_state=RANDOM_STATE,
+        # class_weight='balanced' is less necessary with SMOTE, but doesn't hurt
+        class_weight='balanced',
+        n_jobs=-1
+    ))
 ])
 
 model_pipeline.fit(X_train, y_train)
 print("Model training complete.")
 
-# --- 9. RESULTS AND EVALUATION ---
-print("\n--- MODEL EVALUATION RESULTS ---")
+# --- 5. RESULTS AND EVALUATION ---
+print("\n--- FINAL MODEL EVALUATION RESULTS ---")
 y_pred = model_pipeline.predict(X_test)
-
 accuracy = accuracy_score(y_test, y_pred)
 macro_f1 = f1_score(y_test, y_pred, average='macro')
 
-print(f"Overall Accuracy: {accuracy:.4f}")
+print(f"\nOverall Accuracy: {accuracy:.4f}")
 print(f"Macro F1-Score: {macro_f1:.4f}\n")
-
 print("Classification Report:")
-print(classification_report(y_test, y_pred))
-print("\nCOnfusion Matrix :\n")
-print(confusion_matrix(y_test, y_pred))
-print("--- END OF SCRIPT ---")
+print(classification_report(y_test, y_pred, target_names=CLASS_NAMES))
+print("\nConfusion Matrix:")
+cm = confusion_matrix(y_test, y_pred)
+cm_df = pd.DataFrame(cm, index=CLASS_NAMES, columns=CLASS_NAMES)
+print(cm_df)
+print("\n--- END OF SCRIPT ---")
