@@ -1,138 +1,120 @@
 import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-warnings.filterwarnings("ignore", category=FutureWarning)
-
-import pandas as pd
+warnings.filterwarnings("ignore")
 import numpy as np
-from pathlib import Path
+import pandas as pd
+import os
+import re
+from tqdm import tqdm
 
-# Scikit-learn Imports
-from sklearn.model_selection import train_test_split, RandomizedSearchCV
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.impute import SimpleImputer
-from sklearn.compose import ColumnTransformer
-from sklearn.pipeline import Pipeline
-from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor
-from sklearn.multioutput import MultiOutputRegressor
-from sklearn.linear_model import RidgeCV
-try:
-    from xgboost import XGBRegressor
-    XGBOOST_AVAILABLE = True
-except ImportError:
-    XGBOOST_AVAILABLE = False
+# --- Deep Learning Imports for Feature Extraction ---
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from tensorflow.keras.applications.mobilenet_v2 import MobileNetV2, preprocess_input
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import GlobalAveragePooling2D
+
+# --- Scikit-learn & Imblearn Imports for the Ensemble ---
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from imblearn.pipeline import Pipeline
+from imblearn.over_sampling import SMOTE
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
+
+# --- Import All Classifiers for the Ensemble ---
+from lightgbm import LGBMClassifier
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier
+from sklearn.linear_model import LogisticRegression
 
 # --- 1. CONFIGURATION ---
-DATA_PATH = 'E:/PROGRAMMING-2/Ensemble-Model-Wate-Classification-Policy-Prediction/dataset/city_level_data_0_0.csv'
-RANDOM_STATE = 42
+# Using the dataset that gave the best performance
+IMAGE_FOLDER_PATH = "E:/PROGRAMMING-2/Ensemble-Model-Wate-Classification-Policy-Prediction/dataset/Dataset-OR"
+RANDOM_STATE = 50
+IMG_SIZE = (224, 224)
+CLASS_NAMES = ['organic', 'recyclable']
 
-# --- 2. DATA LOADING ---
-print("Step 2: Loading and verifying the dataset...")
-df = pd.read_csv(DATA_PATH)
-print(f"Loaded data with {df.shape[0]} rows.")
+# --- 2. LOAD MobileNetV2 AND EXTRACT DEEP FEATURES ---
+print("Step 2: Loading MobileNetV2 model and extracting deep features...")
 
-# --- 3. FEATURE AND TARGET SELECTION ---
-print("\nStep 3: Selecting available features and targets...")
-potential_feature_cols = [
-    'income_id', 'population_population_number_of_people', 'total_msw_total_msw_generated_tons_year',
-    'waste_treatment_anaerobic_digestion_percent', 'waste_treatment_compost_percent',
-    'waste_treatment_incineration_percent', 'waste_treatment_landfill_percent', 'waste_treatment_recycling_percent'
-]
-potential_target_cols = [
-    'composition_food_organic_waste_percent', 'composition_glass_percent', 'composition_metal_percent',
-    'composition_other_percent', 'composition_paper_cardboard_percent', 'composition_plastic_percent',
-    'composition_rubber_leather_percent', 'composition_wood_percent', 'composition_yard_garden_green_waste_percent'
-]
+base_model = MobileNetV2(weights='imagenet', include_top=False, input_shape=(IMG_SIZE[0], IMG_SIZE[1], 3))
+x = base_model.output
+x = GlobalAveragePooling2D()(x)
+feature_extractor = Model(inputs=base_model.input, outputs=x)
 
-feature_cols = [col for col in potential_feature_cols if col in df.columns]
-target_cols = [col for col in potential_target_cols if col in df.columns]
+print("MobileNetV2 model loaded successfully.")
 
-print(f"\nFound and using {len(feature_cols)} feature columns: {feature_cols}")
-df_model = df[feature_cols + target_cols].copy()
-df_model.dropna(subset=target_cols, how='all', inplace=True)
-print(f"Data shape after cleaning: {df_model.shape}")
+all_features = []
+all_labels = []
 
-# --- 4. FEATURE AND TARGET PREPARATION ---
-print("\nStep 4: Preparing features (X) and targets (y)...")
-X = df_model[feature_cols]
-y = df_model[target_cols]
-target_imputer = SimpleImputer(strategy='mean')
-y = pd.DataFrame(target_imputer.fit_transform(y), columns=y.columns)
-
-# --- 5. DATA SPLITTING ---
-print("\nStep 5: Splitting data into training and testing sets...")
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, random_state=RANDOM_STATE)
-
-# --- 6. PREPROCESSING PIPELINE DEFINITION ---
-print("\nStep 6: Building the feature preprocessing pipeline...")
-categorical_features = X.select_dtypes(include=['object', 'category']).columns.tolist()
-numeric_features = X.select_dtypes(include=np.number).columns.tolist()
-
-numeric_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='median')), ('scaler', StandardScaler())])
-categorical_transformer = Pipeline(steps=[('imputer', SimpleImputer(strategy='most_frequent')), ('onehot', OneHotEncoder(handle_unknown='ignore'))])
-
-preprocessor = ColumnTransformer(transformers=[('num', numeric_transformer, numeric_features), ('cat', categorical_transformer, categorical_features)])
-
-# --- 7. ENSEMBLE MODEL DEFINITION ---
-print("\nStep 7: Defining the ensemble regression model...")
-estimators = [
-    ('rf', RandomForestRegressor(random_state=RANDOM_STATE)),
-    ('gb', GradientBoostingRegressor(random_state=RANDOM_STATE))
-]
-if XGBOOST_AVAILABLE:
-    estimators.append(('xgb', XGBRegressor(objective='reg:squarederror', random_state=RANDOM_STATE)))
-
-stacking_regressor = StackingRegressor(estimators=estimators, final_estimator=RidgeCV(), cv=5)
-
-# The final model pipeline
-model_pipeline = Pipeline(steps=[
-    ('preprocessor', preprocessor),
-    ('regressor', MultiOutputRegressor(stacking_regressor))
-])
-
-# --- 8. HYPERPARAMETER TUNING ---
-print("\nStep 8: Performing Hyperparameter Tuning...")
-
-# Define the settings we want to test.
-# The format 'regressor__estimator__<model_name>__<parameter>' targets each part of the pipeline.
-param_distributions = {
-    'regressor__estimator__rf__n_estimators': [50, 100, 200],
-    'regressor__estimator__rf__max_depth': [None, 10, 20],
-    'regressor__estimator__gb__n_estimators': [50, 100, 200],
-    'regressor__estimator__gb__learning_rate': [0.01, 0.1, 0.2]
+PREFIX_TO_LABEL_MAP = {
+    'o': 0, 'r': 1
 }
 
-# Set up the search. It will try 20 random combinations from the distributions above.
-random_search = RandomizedSearchCV(
-    model_pipeline,
-    param_distributions=param_distributions,
-    n_iter=20, # Number of parameter settings that are sampled.
-    cv=3,      # Use 3-fold cross-validation.
-    random_state=RANDOM_STATE,
-    n_jobs=-1  # Use all available CPU cores to speed up the process.
+image_files_to_process = [f for f in os.listdir(IMAGE_FOLDER_PATH) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+
+for filename in tqdm(image_files_to_process, desc="Extracting Features"):
+    match = re.match(r"([a-zA-Z]+)", filename)
+    if not match: continue
+    prefix = match.group(1).lower()
+    if prefix in PREFIX_TO_LABEL_MAP:
+        label = PREFIX_TO_LABEL_MAP[prefix]
+        file_path = os.path.join(IMAGE_FOLDER_PATH, filename)
+        try:
+            img = load_img(file_path, target_size=IMG_SIZE)
+            img_array = img_to_array(img)
+            img_batch = np.expand_dims(img_array, axis=0)
+            img_preprocessed = preprocess_input(img_batch)
+            features = feature_extractor.predict(img_preprocessed)
+            all_features.append(features.flatten())
+            all_labels.append(label)
+        except Exception as e:
+            print(f"  - Warning: Could not process image {filename}. Error: {e}")
+
+X = np.array(all_features)
+y = np.array(all_labels)
+print(f"\nData loaded successfully. Total samples: {len(X)}")
+
+# --- 3. DATA SPLITTING ---
+print("\nStep 3: Splitting data...")
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.20, stratify=y, random_state=RANDOM_STATE)
+
+# --- 4. BUILD & TRAIN THE FINAL ENSEMBLE MODEL ---
+print("\nStep 4: Defining and training the final ENSEMBLE model...")
+
+# Define the individual models for the ensemble
+clf1 = LGBMClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1)
+clf2 = RandomForestClassifier(n_estimators=200, random_state=RANDOM_STATE, n_jobs=-1)
+# Logistic Regression is a fast and effective choice to add diversity
+clf3 = LogisticRegression(random_state=RANDOM_STATE, max_iter=1000)
+
+# Create the VotingClassifier ensemble
+# It combines the three classifiers using a majority vote ('hard' voting)
+ensemble_model = VotingClassifier(
+    estimators=[('lgbm', clf1), ('rf', clf2), ('lr', clf3)],
+    voting='hard',
+    n_jobs=-1
 )
 
-# Run the search on the training data. This is the main training step.
-random_search.fit(X_train, y_train)
+# Create the full pipeline with all steps
+model_pipeline = Pipeline(steps=[
+    ('smote', SMOTE(random_state=RANDOM_STATE)),
+    ('scaler', StandardScaler()),
+    ('classifier', ensemble_model)
+])
 
-print("\nHyperparameter tuning complete.")
-print("Best parameters found:")
-print(random_search.best_params_)
+model_pipeline.fit(X_train, y_train)
+print("Model training complete.")
 
-# --- 9. RESULTS AND EVALUATION ---
+# --- 5. RESULTS AND EVALUATION ---
 print("\n--- FINAL MODEL EVALUATION RESULTS ---")
-# Use the best model found by the search to make predictions.
-best_model = random_search.best_estimator_
-y_pred = best_model.predict(X_test)
+y_pred = model_pipeline.predict(X_test)
+accuracy = accuracy_score(y_test, y_pred)
+macro_f1 = f1_score(y_test, y_pred, average='macro')
 
-r2 = r2_score(y_test, y_pred)
-mae = mean_absolute_error(y_test, y_pred)
-mse = mean_squared_error(y_test, y_pred)
-accuracy = 1 - (mse / np.var(y_test))
-
-print(f"\nResults using the best model:")
-print(f"R-squared (R²): {r2:.4f}")
-print(f"Mean Absolute Error (MAE): {mae:.4f}")
-print(f"Mean Squared Error (MSE): {mse:.4f}")
-print(f"Accuracy: {accuracy}")
+print(f"\nOverall Accuracy: {accuracy:.4f}")
+print(f"Macro F1-Score: {macro_f1:.4f}\n")
+print("Classification Report:")
+print(classification_report(y_test, y_pred, target_names=CLASS_NAMES))
+print("\nConfusion Matrix:")
+cm = confusion_matrix(y_test, y_pred)
+cm_df = pd.DataFrame(cm, index=CLASS_NAMES, columns=CLASS_NAMES)
+print(cm_df)
 print("\n--- END OF SCRIPT ---")
